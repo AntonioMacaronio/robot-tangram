@@ -135,7 +135,7 @@ def create_dataloaders(csv_file=CSV_FILE,
                       image_dir=IMAGE_DIR,
                       batch_size=BATCH_SIZE,
                       num_workers=NUM_WORKERS,
-                      train_split=0.8,
+                      train_split=0.9,
                       image_size=224):
     """
     Create train and validation dataloaders.
@@ -266,13 +266,79 @@ class LogisticRegression():
     #     pass
 
 
+def set_seed(seed=42):
+    """Set random seeds for reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    # Make cudnn deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def evaluate(backbone_model, classifier_model, val_loader, device):
+    """
+    Evaluate the model on validation set.
+
+    Args:
+        backbone_model: Frozen ResNet backbone
+        classifier_model: Logistic regression classifier
+        val_loader: Validation data loader
+        device: Device to run on
+
+    Returns:
+        dict: Dictionary with validation metrics (loss, accuracy)
+    """
+    val_loss = 0.0
+    correct = 0
+    total = 0
+
+    for images, shape_ids, labels in val_loader:
+        images = images.to(device)
+        shape_ids = shape_ids.to(device)
+        labels = labels.to(device).float()
+
+        # Extract image features using frozen ResNet
+        with torch.no_grad():
+            img_features = backbone_model(images)
+
+            # Create one-hot embeddings for shape IDs
+            shape_ids_embeddings = torch.nn.functional.one_hot(shape_ids - 1, num_classes=7).float()
+            combined_input = torch.cat([img_features, shape_ids_embeddings], dim=1)
+            outputs = classifier_model.forward(combined_input).squeeze(-1)
+
+            # Compute loss
+            loss = torch.nn.functional.binary_cross_entropy(outputs, labels)
+            val_loss += loss.item()
+
+            # Compute accuracy
+            predictions = (outputs > 0.5).float()
+            correct += (predictions == labels).sum().item()
+            total += labels.size(0)
+
+    avg_val_loss = val_loss / len(val_loader)
+    accuracy = correct / total if total > 0 else 0.0
+
+    return {
+        "loss": avg_val_loss,
+        "accuracy": accuracy
+    }
+
+
 def train_classifier(
     learning_rate = 1e-4,
     num_epochs = 100,
     batch_size = 128,
+    weight_decay = 0.99,
     use_wandb = True,
-    experiment_name = "tangram-classifier-basic",
+    experiment_name = "tangram-classifier-decay",
+    seed = 42,
 ):
+    # Set random seeds for reproducibility
+    set_seed(seed)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Initialize wandb
@@ -284,8 +350,10 @@ def train_classifier(
                 "learning_rate": learning_rate,
                 "num_epochs": num_epochs,
                 "batch_size": batch_size,
+                "weight_decay": weight_decay,
                 "architecture": "ResNet18 + LogisticRegression",
                 "device": device,
+                "seed": seed,
             }
         )
 
@@ -329,36 +397,47 @@ def train_classifier(
             grad_W = (error.T @ combined_input) / batch_size    # Gradient w.r.t. weights: dL/dW = error.T @ x / batch_size
             grad_b = error.sum(dim=0) / batch_size              # Gradient w.r.t. bias: dL/db = error.sum(dim=0) / batch_size
 
-            # SGD update: θ = θ - lr * grad
+            # SGD update with weight decay: θ = θ - lr * (grad + weight_decay * θ)
+            # Note: Weight decay is only applied to weights, not biases (standard practice)
             with torch.no_grad():
                 classifier_model.W -= learning_rate * grad_W
                 classifier_model.b -= learning_rate * grad_b
+            # learning_rate *= weight_decay
 
-            # Log to wandb
+            # log wandb stuff
             if use_wandb:
                 wandb.log({
                     "train/loss": loss.item(),
                     "train/grad_W_norm": grad_W.norm().item(),
                     "train/grad_b_norm": grad_b.norm().item(),
+                    "train/W_norm": classifier_model.W.norm().item(),
                     "epoch": epoch,
                 }, step=global_step)
-
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
-
             if global_step % 10 == 0:
                 print(f"Epoch {epoch+1}/{num_epochs}, Step {global_step}, Loss: {loss.item():.4f}, "
-                      f"Grad W: {grad_W.norm().item():.4f}, Grad b: {grad_b.norm().item():.4f}")
+                      f"Grad W: {grad_W.norm().item():.4f}, Grad b: {grad_b.norm().item():.4f}, "
+                      f"W norm: {classifier_model.W.norm().item():.4f}")
 
         # Log epoch-level metrics
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+
+        # Evaluate on validation set
+        val_metrics = evaluate(backbone_model, classifier_model, val_loader, device)
+
         if use_wandb:
             wandb.log({
                 "train/epoch_loss": avg_epoch_loss,
+                "val/loss": val_metrics["loss"],
+                "val/accuracy": val_metrics["accuracy"],
             }, step=global_step)
 
-        print(f"Epoch {epoch+1}/{num_epochs} completed. Avg Loss: {avg_epoch_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} completed. "
+              f"Train Loss: {avg_epoch_loss:.4f}, "
+              f"Val Loss: {val_metrics['loss']:.4f}, "
+              f"Val Acc: {val_metrics['accuracy']:.4f}")
 
     if use_wandb:
         wandb.finish()
