@@ -21,6 +21,9 @@ from PIL import Image
 import numpy as np
 import math
 import tyro
+import wandb
+import tqdm
+
 # Configuration
 IMAGE_DIR = "tangram-imgs"
 CSV_FILE = "tangram_annotations.csv"
@@ -264,12 +267,26 @@ class LogisticRegression():
 
 
 def train_classifier(
-    learning_rate = 0.01,
-    num_epochs = 10,
-    batch_size = 8,
-
+    learning_rate = 1e-4,
+    num_epochs = 100,
+    batch_size = 128,
+    use_wandb = True,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Initialize wandb
+    if use_wandb:
+        wandb.init(
+            project="tangram-classifier",
+            config={
+                "learning_rate": learning_rate,
+                "num_epochs": num_epochs,
+                "batch_size": batch_size,
+                "architecture": "ResNet18 + LogisticRegression",
+                "device": device,
+            }
+        )
+
     print("Creating dataloaders...")
     train_loader, val_loader = create_dataloaders(batch_size=batch_size, num_workers=4) # B=8 is the batch size
 
@@ -282,11 +299,15 @@ def train_classifier(
 
     classifier_model = LogisticRegression(input_size=512 + 7, output_size=1, device=device)
 
+    global_step = 0
     for epoch in range(num_epochs):
-        for images, shape_ids, labels in train_loader:
+        epoch_loss = 0.0
+        num_batches = 0
+
+        for images, shape_ids, labels in tqdm.tqdm(train_loader, desc="Training", leave=False):
             images = images.to(device)          # torch.Size([8, 3, 224, 224])
             shape_ids = shape_ids.to(device)    # torch.Size([8])
-            labels = labels.to(device)          # torch.Size([8])
+            labels = labels.to(device).float()  # torch.Size([8])
 
             # Extract image features using frozen ResNet
             with torch.no_grad():
@@ -296,15 +317,13 @@ def train_classifier(
             # IMPORTANT: shape_ids are 1-7, but one_hot expects 0-6, so subtract 1!
             shape_ids_embeddings = torch.nn.functional.one_hot(shape_ids - 1, num_classes=7).float()    # torch.Size([8, 7])
             combined_input = torch.cat([img_features, shape_ids_embeddings], dim=1)                     # torch.Size([8, 519])
+            outputs = classifier_model.forward(combined_input).squeeze(-1)                              # torch.Size([8])
 
-            outputs = classifier_model.forward(combined_input) # [8, 1]
-
-            # Compute loss
+            # Compute loss for record keeping
             loss = torch.nn.functional.binary_cross_entropy(outputs, labels)
-            print(f"Loss: {loss.item():.4f}")
 
             # Manual stochastic gradient descent update:
-            error = outputs - labels                            # [batch_size, output_size]
+            error = (outputs - labels).unsqueeze(-1)            # [batch_size, 1]
             grad_W = (error.T @ combined_input) / batch_size    # Gradient w.r.t. weights: dL/dW = error.T @ x / batch_size
             grad_b = error.sum(dim=0) / batch_size              # Gradient w.r.t. bias: dL/db = error.sum(dim=0) / batch_size
 
@@ -313,8 +332,34 @@ def train_classifier(
                 classifier_model.W -= learning_rate * grad_W
                 classifier_model.b -= learning_rate * grad_b
 
-            print(f"Gradient norm - W: {grad_W.norm().item():.4f}, b: {grad_b.norm().item():.4f}")
+            # Log to wandb
+            if use_wandb:
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/grad_W_norm": grad_W.norm().item(),
+                    "train/grad_b_norm": grad_b.norm().item(),
+                    "epoch": epoch,
+                }, step=global_step)
 
+            epoch_loss += loss.item()
+            num_batches += 1
+            global_step += 1
+
+            if global_step % 10 == 0:
+                print(f"Epoch {epoch+1}/{num_epochs}, Step {global_step}, Loss: {loss.item():.4f}, "
+                      f"Grad W: {grad_W.norm().item():.4f}, Grad b: {grad_b.norm().item():.4f}")
+
+        # Log epoch-level metrics
+        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0.0
+        if use_wandb:
+            wandb.log({
+                "train/epoch_loss": avg_epoch_loss,
+            }, step=global_step)
+
+        print(f"Epoch {epoch+1}/{num_epochs} completed. Avg Loss: {avg_epoch_loss:.4f}")
+
+    if use_wandb:
+        wandb.finish()
     print("Training completed!")
 
 if __name__ == "__main__":
