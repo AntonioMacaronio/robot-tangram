@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Webscraper to download tangram solution images using cloudscraper
-This version can bypass Cloudflare and similar protections
+This scraper:
+1. Visits category pages (geometrical shapes, letters, people, etc.)
+2. Extracts links to individual solution pages
+3. Visits each solution page and downloads the solution image
 """
 
 import os
@@ -22,7 +25,15 @@ except ImportError:
 from bs4 import BeautifulSoup
 
 # Configuration
-BASE_URL = "https://www.tangram-channel.com/tangram-solutions/"
+CATEGORY_URLS = [
+    "https://www.tangram-channel.com/tangram-solutions/geometrical-shapes/",
+    "https://www.tangram-channel.com/tangram-solutions/letters-numbers-signs/",
+    "https://www.tangram-channel.com/tangram-solutions/people/",
+    "https://www.tangram-channel.com/tangram-solutions/animals/",
+    "https://www.tangram-channel.com/tangram-solutions/usual-objects/",
+    "https://www.tangram-channel.com/tangram-solutions/boats/",
+    "https://www.tangram-channel.com/tangram-solutions/miscellaneous/",
+]
 OUTPUT_DIR = "tangram-imgs"
 
 def create_output_directory():
@@ -48,6 +59,88 @@ def download_image(scraper, img_url, filename):
         print(f"Failed to download {filename}: {e}")
         return False
 
+def get_solution_links_from_category(scraper, category_url):
+    """Extract all solution page links from a category page"""
+    try:
+        print(f"\nFetching category page: {category_url}")
+        response = scraper.get(category_url, timeout=15)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Find all links that point to solution pages
+        # Solution pages have URLs like: tangram-channel.com/tangrams-pages/tangram-*-solution-*/
+        solution_links = []
+
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            # Look for links to solution pages
+            if '/tangrams-pages/' in href and 'solution' in href:
+                full_url = urljoin(category_url, href)
+                solution_links.append(full_url)
+
+        # Remove duplicates
+        solution_links = list(set(solution_links))
+        print(f"Found {len(solution_links)} solution pages")
+        return solution_links
+
+    except Exception as e:
+        print(f"Error fetching category {category_url}: {e}")
+        return []
+
+def get_solution_image_from_page(scraper, solution_url):
+    """Extract the solution image from a specific solution page"""
+    try:
+        response = scraper.get(solution_url, timeout=15)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # The solution image is within <div class="jtpl-section__gutter cc-content-parent">
+        # Navigate the specific structure to find the image
+        gutter_div = soup.find('div', class_='jtpl-section__gutter')
+
+        if gutter_div:
+            # Find the j-imageSubtitle div within the gutter
+            image_subtitle_div = gutter_div.find('div', class_=lambda x: x and 'j-imageSubtitle' in x)
+
+            if image_subtitle_div:
+                img = image_subtitle_div.find('img')
+                if img:
+                    # Try to get the src from various attributes
+                    src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+
+                    # Make sure it's a jimcdn.com URL (the actual solution images)
+                    if src and 'jimcdn.com' in src:
+                        print(f"  Found solution image: {os.path.basename(src)}")
+                        return urljoin(solution_url, src)
+
+        # Fallback: Look for ANY image with jimcdn.com and tangram in the URL
+        all_imgs = soup.find_all('img')
+        for img in all_imgs:
+            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+            if src and 'jimcdn.com' in src and 'tangram' in src.lower():
+                # Skip very small dimensions (thumbnails)
+                width = img.get('data-src-width') or img.get('width')
+                if width:
+                    try:
+                        if int(width) >= 300:  # Only images 300px or larger
+                            print(f"  Found solution image (fallback): {os.path.basename(src)}")
+                            return urljoin(solution_url, src)
+                    except:
+                        pass
+                else:
+                    # No width info, assume it's good
+                    print(f"  Found solution image (fallback): {os.path.basename(src)}")
+                    return urljoin(solution_url, src)
+
+        print(f"  Warning: No solution image found with expected structure")
+        return None
+
+    except Exception as e:
+        print(f"Error fetching solution page {solution_url}: {e}")
+        return None
+
 def scrape_tangram_solutions():
     """Main scraping function"""
     create_output_directory()
@@ -62,101 +155,65 @@ def scrape_tangram_solutions():
     )
 
     try:
-        print(f"Fetching {BASE_URL}...")
-        response = scraper.get(BASE_URL, timeout=15)
-        response.raise_for_status()
-        print(f"Successfully fetched page (status: {response.status_code})")
+        all_solution_links = []
 
-        # Parse the HTML
-        soup = BeautifulSoup(response.content, 'html.parser')
-        print(f"Page title: {soup.title.string if soup.title else 'N/A'}")
+        # Step 1: Get all solution page links from all categories
+        print("="*60)
+        print("STEP 1: Collecting solution page links from all categories")
+        print("="*60)
 
-        # Find all images
-        image_urls = set()
+        for category_url in CATEGORY_URLS:
+            links = get_solution_links_from_category(scraper, category_url)
+            all_solution_links.extend(links)
+            time.sleep(1)  # Be respectful to the server
 
-        # Method 1: Find all img tags
-        img_tags = soup.find_all('img')
-        print(f"Found {len(img_tags)} img tags")
+        print(f"\n{'='*60}")
+        print(f"Total solution pages found: {len(all_solution_links)}")
+        print(f"{'='*60}")
 
-        for img in img_tags:
-            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-            if src:
-                # Make absolute URL
-                full_url = urljoin(BASE_URL, src)
+        # Step 2: Visit each solution page and download the image
+        print("\nSTEP 2: Downloading solution images")
+        print("="*60)
 
-                # Skip very small images and common non-content images
-                if any(skip in full_url.lower() for skip in ['logo', 'icon', 'avatar', 'button']):
-                    continue
-
-                # Add image if it looks like content
-                if any(ext in full_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                    image_urls.add(full_url)
-
-        # Method 2: Find images in links
-        for a in soup.find_all('a'):
-            href = a.get('href', '')
-            if any(ext in href.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                full_url = urljoin(BASE_URL, href)
-                image_urls.add(full_url)
-
-        # Method 3: Look for WordPress gallery images (common pattern)
-        for div in soup.find_all(['div', 'figure'], class_=lambda x: x and ('gallery' in x.lower() or 'image' in x.lower() or 'wp-block' in x.lower())):
-            for img in div.find_all('img'):
-                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-                if src:
-                    full_url = urljoin(BASE_URL, src)
-                    if any(ext in full_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                        image_urls.add(full_url)
-
-        image_urls = list(image_urls)
-        print(f"\nFound {len(image_urls)} unique images to download")
-
-        if not image_urls:
-            print("\nNo images found. Saving page HTML for manual inspection...")
-            with open('page_source.html', 'w', encoding='utf-8') as f:
-                f.write(response.text)
-            print("Saved to page_source.html")
-
-            print("\nFirst 10 img tags found:")
-            for i, img in enumerate(img_tags[:10], 1):
-                print(f"{i}. src={img.get('src')}, class={img.get('class')}, alt={img.get('alt')}")
-
-        # Download images
         downloaded = 0
         failed = 0
 
-        for i, img_url in enumerate(image_urls, 1):
-            # Generate filename
-            filename = os.path.basename(urlparse(img_url).path)
-            if not filename or '.' not in filename:
-                ext = 'jpg'
-                if '.png' in img_url.lower():
-                    ext = 'png'
-                elif '.webp' in img_url.lower():
-                    ext = 'webp'
-                elif '.gif' in img_url.lower():
-                    ext = 'gif'
-                filename = f"tangram_{i:03d}.{ext}"
+        for i, solution_url in enumerate(all_solution_links, 1):
+            print(f"\n[{i}/{len(all_solution_links)}] Processing: {solution_url}")
 
-            # Clean filename
-            filename = filename.split('?')[0]  # Remove query parameters
+            # Get the image URL from the solution page
+            img_url = get_solution_image_from_page(scraper, solution_url)
 
-            # Be respectful to the server
-            if i > 1:
-                time.sleep(0.5)
+            if img_url:
+                # Generate filename from the solution URL
+                # Extract solution name from URL
+                url_parts = solution_url.rstrip('/').split('/')
+                solution_name = url_parts[-1] if url_parts else f"solution_{i}"
 
-            if download_image(scraper, img_url, filename):
-                downloaded += 1
+                # Get file extension from image URL
+                img_filename = os.path.basename(urlparse(img_url).path)
+                ext = img_filename.split('.')[-1].split('?')[0] if '.' in img_filename else 'jpg'
+
+                filename = f"{solution_name}.{ext}"
+
+                if download_image(scraper, img_url, filename):
+                    downloaded += 1
+                else:
+                    failed += 1
             else:
+                print(f"  No image found on this page")
                 failed += 1
 
-        print(f"\n{'='*50}")
-        print(f"Download complete!")
+            # Be respectful to the server
+            time.sleep(0.5)
+
+        print(f"\n{'='*60}")
+        print(f"DOWNLOAD COMPLETE!")
         print(f"Successfully downloaded: {downloaded}")
         print(f"Failed: {failed}")
-        print(f"Total: {len(image_urls)}")
+        print(f"Total solution pages: {len(all_solution_links)}")
         print(f"Images saved to: {OUTPUT_DIR}/")
-        print(f"{'='*50}")
+        print(f"{'='*60}")
 
     except Exception as e:
         print(f"Error: {e}")
